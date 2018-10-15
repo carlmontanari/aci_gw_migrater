@@ -1,0 +1,3 @@
+Gateway,SubnetMask,Tenant,AppProfile,EPG,BD
+X.X.X.X,/24,My_Tenant,My_AP,My_EPG,My_BD
+X.X.X.X,/24,My_Tenant,My_AP,My_EPG,My_BD
