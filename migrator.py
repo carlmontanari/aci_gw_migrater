@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import time
 from acipdt import acipdt
 import pandas
 from netmiko import ConnectHandler
@@ -37,6 +38,8 @@ MAX_CONNS = 4
 ACI_HOST = 'X.X.X.X'
 ACI_USERNAME = None
 ACI_PASSWORD = None
+SNAPSHOT = True
+SNAPSHOT_FILE_NAME = 'aci_gw_migrator'
 
 # CSV COLUMNS
 CSV_COLUMNS = ['Gateway', 'SubnetMask', 'Tenant', 'AppProfile', 'EPG', 'BD']
@@ -88,23 +91,29 @@ def vlan(vl_id):
     return(vl_id)
 
 
-def continue_or_exit():
+def continue_or_exit(msg=None):
     """Prompt user to exit script (default) or continue
 
     Args:
         N/A
 
+    Kwargs:
+        msg (optional): Message to display to user
+
     Returns:
         None or exits script
     """
+    if msg:
+        LOGGER.critical(msg)
+
     LOGGER.debug('Prompting user to continue or exit.')
     while True:
-        user_input = input("Would you like to exit script, 'y' or 'n' [y]: ")
+        user_input = input("Would you like to continue, 'y' or 'n' [n]: ")
         selection = user_input or 'n'
-        if selection.lower() == 'y':
+        if selection.lower() == 'n':
             LOGGER.debug('User decided to exit. Exiting.')
-            sys.exit(1)
-        elif selection.lower() == 'n':
+            sys.exit(0)
+        elif selection.lower() == 'y':
             LOGGER.debug('User decided to continue. Moving on.')
             return(None)
 
@@ -407,7 +416,8 @@ def aci_bd_enable_unicast(fablogin, tn_name, bd_name):
 
     Args:
         fablogin (acipdt fabric login object)
-        gw (str)
+        tn_name (str) name of tenant in ACI
+        bd_name (str) name of bridge domain in ACI
 
     Returns:
         N/A
@@ -438,7 +448,10 @@ def aci_bd_add_subnet(fablogin, tn_name, bd_name, subnet, scope='private'):
 
     Args:
         fablogin (acipdt fabric login object)
-        gw (str)
+        tn_name (str) name of tenant in ACI
+        bd_name (str) name of bridge domain in ACI
+        subnet (str) cidr notation of subnet, ex: 1.1.1.1/24
+        scope (str) (optional) public | private | shared | public,shared
 
     Returns:
         N/A
@@ -466,6 +479,117 @@ def aci_bd_add_subnet(fablogin, tn_name, bd_name, subnet, scope='private'):
                         f'{bd_name}. Continuing, but there may be issues...')
 
 
+def aci_snapshot_exist(fablogin, snapshot_file_name):
+    """Check if ACI Snapshot exists
+
+    Args:
+        fablogin (acipdt fabric login object)
+        snapshot_file_name (str) name of snapshot in aci
+            ACI will append datetime info so this should be the 'base' filename
+
+    Returns:
+        snapshot_dns (list) dns of snapshots containing snapshot_file_name
+            This list is ordered most recent to oldest
+    """
+    query = acipdt.Query(fablogin.apic, fablogin.cookies)
+    query_string = 'configSnapshot'
+    query_result = query.query_class(query_string)[1]['imdata']
+    snap = [snap for snap in query_result if snapshot_file_name in
+            snap['configSnapshot']['attributes']['fileName']]
+    if snap:
+        snapshot_dns = sorted(snap, key=lambda k:
+                              k['configSnapshot']['attributes']['modTs'],
+                              reverse=True)
+        snapshot_dns = [snap['configSnapshot']['attributes']['dn'] for
+                        snap in snapshot_dns]
+        return(snapshot_dns)
+    else:
+        return(None)
+
+
+def aci_snapshot_policy(fablogin, snapshot_file_name, status='created'):
+    """Take or Delete ACI Snapshot
+
+    Args:
+        fablogin (acipdt fabric login object)
+        snapshot_file_name (str) name of snapshot in aci
+            ACI will append datetime info so this should be the 'base' filename
+
+    Kwargs:
+        status (str) (optional) created | modified | created,modified | deleted
+
+    Returns:
+        True if status == 200
+        False if other
+    """
+    snapshot_args = {}
+    snapshot_args['name'] = snapshot_file_name
+    snapshot_args['snapshot'] = 'true'
+    snapshot_args['status'] = status
+    cfgmgmt = acipdt.FabCfgMgmt(fablogin.apic, fablogin.cookies)
+    status = cfgmgmt.backup(**snapshot_args)
+    if status == 200:
+        return(True)
+    else:
+        return(False)
+
+
+def aci_retire_snapshot(fablogin, snapshot_dn):
+    """Retire (delete) a snapshot
+
+    Args:
+        fablogin (acipdt fabric login object)
+        snapshot_dn (str) distinguished name of snapshot to retire
+
+    Returns:
+        True if status == 200
+        False if other
+    """
+    payload = f'''
+{{
+    "configSnapshot": {{
+        "attributes": {{
+            "dn": "{snapshot_dn}",
+            "retire": "true"
+        }}
+    }}
+}}
+    '''
+    uri = f'mo/{snapshot_dn}'
+    LOGGER.info(f'Sending the following payload to ACI at URI {uri}:\n'
+                f'{payload}')
+    status = acipdt.post(fablogin.apic, payload, fablogin.cookies, uri)
+    LOGGER.info(f'ACI returned the following status: {status}.')
+    if status == 200:
+        return(True)
+    else:
+        LOGGER.critical('Failed to delete snapshot. Continuing.')
+        return(False)
+
+
+def aci_snapshot_rollback(fablogin, snapshot_dn):
+    """Rollback to an ACI Snapshot
+
+    Args:
+        fablogin (acipdt fabric login object)
+        snapshot_dn (str) distinguished name of snapshot to rollback to
+
+    Returns:
+        True if status == 200
+        False if other
+    """
+    query = acipdt.Query(fablogin.apic, fablogin.cookies)
+    snapshot_filename = query.query_dn(snapshot_dn)[1]['imdata'][0]['configSnapshot']['attributes']['fileName']
+    cfgmgmt = acipdt.FabCfgMgmt(fablogin.apic, fablogin.cookies)
+    snapshot_args = {}
+    snapshot_args['name'] = snapshot_filename
+    status = cfgmgmt.snapback(**snapshot_args)
+    if status == 200:
+        return(True)
+    else:
+        return(False)
+
+
 def migrate_gw(dev, gw, username, password, fablogin):
     """Migrate gateway from legacy device to ACI
 
@@ -486,6 +610,7 @@ def migrate_gw(dev, gw, username, password, fablogin):
     aci_bd_enable_unicast(fablogin, gw['Tenant'], gw['BD'])
     aci_bd_add_subnet(fablogin, gw['Tenant'], gw['BD'],
                       f'{gw["Gateway"]}{gw["SubnetMask"]}')
+
 
 
 def main():
@@ -624,6 +749,24 @@ def main():
     for dev in conns:
         disconnect(dev)
 
+    # If SNAPSHOT set to TRUE, check if exists, delete if needed
+    # and take a new one
+    if SNAPSHOT:
+        snapshot_dns = aci_snapshot_exist(fablogin, SNAPSHOT_FILE_NAME)
+        if snapshot_dns:
+            LOGGER.info(f'Multiple snapshots containing {SNAPSHOT_FILE_NAME} '
+                        f'exist:\n{snapshot_dns}')
+            msg = (f'Snapshot(s) exist containing "{SNAPSHOT_FILE_NAME}"; '
+                   'do you want to continue?')
+            continue_or_exit(msg=msg)
+            # Should I delete the old snaps here?
+        # Create policy and take snapshot; sleep to ensure snapshot is taken
+        # before deleting policy
+        aci_snapshot_policy(fablogin, SNAPSHOT_FILE_NAME)
+        time.sleep(2)
+        # Clean up aci_gw_migrator snapshot policy
+        aci_snapshot_policy(fablogin, SNAPSHOT_FILE_NAME, status='deleted')
+
     # Create up to MAX_CONNS processes to move gateways
     for dev in LEGACY_DEVICES:
         with Pool(processes=MAX_CONNS) as p:
@@ -632,6 +775,31 @@ def main():
                                                 password, fablogin))
             p.close()
             p.join()
+
+    # If SNAPSHOT set to TRUE offer rollback or delete snapshot
+    if SNAPSHOT:
+        msg = ('Migration complete, if you chose to continue you can '
+               'rollback or delete the snapshot.')
+        continue_or_exit(msg=msg)
+        while True:
+            user_input = input("If you would like you can rollback [r] to the"
+                               " previous snapshot, delete [d] the previous "
+                               "snapshot or exit [exit] the script. What would"
+                               " you like to do? 'r', 'd' or 'exit' [exit]: ")
+            selection = user_input or 'exit'
+            if selection.lower() == 'exit':
+                LOGGER.debug('User decided to exit. Exiting.')
+                sys.exit(0)
+            elif selection.lower() == 'r':
+                LOGGER.debug('User decided to rollback ACI.')
+                snapshot_dns = aci_snapshot_exist(fablogin, SNAPSHOT_FILE_NAME)
+                aci_snapshot_rollback(fablogin, snapshot_dns[0])
+                sys.exit(0)
+            elif selection.lower() == 'd':
+                LOGGER.debug('User decided to delete ACI snapshot.')
+                snapshot_dns = aci_snapshot_exist(fablogin, SNAPSHOT_FILE_NAME)
+                aci_retire_snapshot(fablogin, snapshot_dns[0])
+                sys.exit(0)
 
 
 if __name__ == '__main__':
